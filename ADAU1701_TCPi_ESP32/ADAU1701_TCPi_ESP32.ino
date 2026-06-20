@@ -9,7 +9,14 @@
 //   - EEPROM selfboot: save program from web interface
 //   - Web portal: WiFi + GPIO pin configuration
 //   - AP mode for first-time setup
-//   - Bluetooth A2DP sink -> I2S output to ADAU1701 (MP0/MP4/MP5 wiring)
+//
+// https://github.com/rarranzb/ADAU1701-TCPi-ESP32
+// License: MIT
+//   - Captures all sl=0 writes during Download
+//   - http://IP/ -> button "Save to EEPROM"
+//   - Writes captured data to EEPROM in ADAU1701 selfboot format
+//   - Replaces "Actions -> Write Latest Compilation to E2Prom"
+//     which does not work over TCP/IP in SigmaStudio
 //
 // https://github.com/rarranzb/ADAU1701-TCPi-ESP32
 // License: MIT
@@ -19,10 +26,6 @@
 #include <Wire.h>
 #include <WebServer.h>
 #include <Preferences.h>
-
-// Bluetooth A2DP and I2S
-#include "BluetoothA2DPSink.h"
-#include <driver/i2s.h>
 
 // ── Factory defaults ──────────────────────────────────────────
 #define FACTORY_SSID      ""
@@ -40,17 +43,7 @@
 #define DEFAULT_LED        2
 #define BOOT_BUTTON_PIN    0
 
-// ── I2S -> ADAU1701 mapping (ESP32 -> ADAU1701 MP pins)
-// Using defaults you asked: DATA -> MP0 (SDATA_IN0) via ESP32 GPIO 22
-//                            BCLK -> MP5 via ESP32 GPIO 26
-//                            LRCLK -> MP4 via ESP32 GPIO 25
-#define I2S_DATA_PIN   22  // connects to ADAU1701 MP0 (SDATA_IN0)
-#define I2S_BCLK_PIN   26  // connects to ADAU1701 MP5 (INPUT_BCLK)
-#define I2S_LRCLK_PIN  25  // connects to ADAU1701 MP4 (INPUT_LRCLK)
-#define I2S_PORT       I2S_NUM_0
-#define AUDIO_SAMPLE_RATE 48000
-
-// ── DSP ───────────��───────────────────────────────────────────
+// ── DSP ───────────────────────────────────────────────────────
 #define DSP_I2C_ADDR      0x34
 #define EEPROM_I2C_ADDR   0x50
 #define TCP_PORT          8086
@@ -73,6 +66,9 @@
 #define BUFFER_SIZE       (1024 * 16)
 
 // ── EEPROM selfboot capture ───────────────────────────────────
+// Selfboot format per record: [len(2)] [addr(2)] [data(len)]
+// End marker: 0x00 0x00
+// 24LC256 = 32KB, page size = 64 bytes
 #define EEPROM_MAX_SIZE   (32 * 1024)
 #define EEPROM_PAGE_SIZE  64
 #define CAPTURE_MAX_SIZE  (28 * 1024)   // leave margin
@@ -96,9 +92,6 @@ int      rxLen           = 0;
 String   savedSSID, savedPassword;
 int      pinSCL, pinSDA, pinRESET, pinSELFBOOT, pinLED;
 
-// Bluetooth A2DP sink
-BluetoothA2DPSink a2dp;
-
 // ── Prototypes ────────────────────────────────────────────────
 void loadConfig();
 void saveWiFi(const String& ssid, const String& pass);
@@ -118,11 +111,6 @@ void handleWrite(uint8_t chipAddr, uint16_t address, uint8_t* data, uint16_t dat
 void handleRead(uint8_t chipAddr, uint16_t address, uint16_t nBytes);
 void safeloadChunk(uint16_t address, uint8_t* data, int words);
 void directWrite(uint8_t i2cAddr, uint16_t regAddr, uint8_t* data, uint16_t dataLen);
-
-// Audio / I2S helpers
-void i2sInit();
-void setupBluetoothAudio();
-void audio_data_cb(const uint8_t *data, uint32_t len);
 
 // =============================================================
 // SETUP
@@ -146,9 +134,6 @@ void setup() {
     tcpServer = new WiFiServer(TCP_PORT);
     tcpServer->begin();
   }
-
-  // Initialize Bluetooth A2DP -> I2S audio to ADAU1701
-  setupBluetoothAudio();
 
   blinkLED(apMode ? 10 : 2);
   if (apMode)
@@ -277,67 +262,14 @@ void startAP() {
 }
 
 // =============================================================
-// Bluetooth A2DP -> I2S (to ADAU1701)
-// =============================================================
-void i2sInit() {
-  // Configure I2S as master, TX only
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = AUDIO_SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_MSB,
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 6,
-    .dma_buf_len = 512,
-    .use_apll = false,
-    .tx_desc_auto_clear = true
-  };
-
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_BCLK_PIN,
-    .ws_io_num  = I2S_LRCLK_PIN,
-    .data_out_num = I2S_DATA_PIN,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
-
-  esp_err_t err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("[I2S] driver install failed: %d\n", err);
-    return;
-  }
-  i2s_set_pin(I2S_PORT, &pin_config);
-  i2s_set_sample_rates(I2S_PORT, AUDIO_SAMPLE_RATE);
-
-  Serial.printf("[I2S] Initialized: data=%d bclk=%d lrclk=%d @ %d Hz\n",
-    I2S_DATA_PIN, I2S_BCLK_PIN, I2S_LRCLK_PIN, AUDIO_SAMPLE_RATE);
-}
-
-void audio_data_cb(const uint8_t *data, uint32_t len) {
-  // Write received PCM data to I2S (blocking). A2DP provides 16-bit PCM (stereo).
-  size_t written = 0;
-  if (len == 0) return;
-  i2s_write(I2S_PORT, (const char*)data, len, &written, portMAX_DELAY);
-}
-
-void setupBluetoothAudio() {
-  // Initialize I2S first
-  i2sInit();
-
-  // Configure A2DP sink to call our stream reader when audio arrives
-  a2dp.set_stream_reader(audio_data_cb);
-
-  // Start Bluetooth A2DP sink with a name
-  a2dp.start("ADAU1701-ESP32-Audio");
-  Serial.println("[BT] A2DP sink started: ADAU1701-ESP32-Audio");
-}
-
-// =============================================================
 // EEPROM CAPTURE
 // During sl=0 (Download), capture every DSP write in selfboot
-// format: [len(2BE)] [addr(2)] [data...]
+// format: [len(2BE)] [addr(2BE)] [data...]
 // =============================================================
 void captureWrite(uint16_t address, uint8_t* data, uint16_t dataLen) {
+  // ADAU1701 selfboot I2C master has limited buffer.
+  // Split large writes into chunks of max 32 words to be safe.
+  // Word sizes: Param RAM = 4 bytes, Prog RAM = 5 bytes, Ctrl = 2 bytes
   int wordSize = 4;
   if (address >= PROG_RAM_START && address <= PROG_RAM_END) wordSize = 5;
   else if (address >= CTRL_REG_START) wordSize = 2;
@@ -357,6 +289,12 @@ void captureWrite(uint16_t address, uint8_t* data, uint16_t dataLen) {
       return;
     }
 
+    // ADAU1701 selfboot EEPROM format (datasheet Table 19):
+    // 0x01               = Write message type
+    // [len_hi][len_lo]   = chipAddr(1) + regAddr(2) + dataBytes
+    // 0x00               = chip address (always 0x00 in EEPROM messages)
+    // [addr_hi][addr_lo] = register address
+    // [data...]
     uint16_t count = bytes + 3;  // chipAddr(1) + regAddr(2) + data
     captureBuffer[captureLen++] = 0x01;                  // Write opcode
     captureBuffer[captureLen++] = (count >> 8) & 0xFF;
@@ -381,6 +319,7 @@ bool writeEEPROM() {
     return false;
   }
 
+  // Append end marker 0x0000
   captureBuffer[captureLen++] = 0x00;
   captureBuffer[captureLen++] = 0x00;
 
@@ -388,6 +327,7 @@ bool writeEEPROM() {
 
   int offset = 0;
   while (offset < captureLen) {
+    // Calculate bytes remaining in current page
     int pageOffset = (offset) % EEPROM_PAGE_SIZE;
     int bytes = min(captureLen - offset, EEPROM_PAGE_SIZE - pageOffset);
 
@@ -397,6 +337,7 @@ bool writeEEPROM() {
     }
     offset += bytes;
 
+    // Progress log every 1KB
     if (offset % 1024 == 0)
       Serial.printf("[EEPROM] %d / %d bytes\n", offset, captureLen);
   }
@@ -415,6 +356,7 @@ bool eepromWritePage(uint16_t memAddr, uint8_t* data, int len) {
     Serial.printf("[EEPROM] I2C err=%d at 0x%04X\n", err, memAddr);
     return false;
   }
+  // Wait for write cycle to complete (24LC256 max 5ms)
   delay(6);
   return true;
 }
@@ -477,6 +419,7 @@ void setupHTTP() {
       body += "<div><b>DSP:</b>" + String(dspRunning ? "&#x25CF; Running" : "&#x25CB; Stopped") + "</div>";
       body += "<div><b>TCP port:</b>" + String(TCP_PORT) + "</div>";
 
+      // EEPROM capture status
       if (captureReady) {
         body += "<div><b>Capture:</b>&#x2705; Ready (" + String(captureLen) + " bytes)</div>";
       } else if (captureLen > 0) {
@@ -492,15 +435,26 @@ void setupHTTP() {
               "</b> and open <b>http://192.168.4.1/config</b> to set up WiFi.</div>";
     }
 
-    // Show BT status
-    body += "<div class='card'><b>Bluetooth:</b> A2DP sink enabled (to ADAU1701)";
-    body += "</div>";
+    // ── DSP Reset ──────────────────────────────────────────
+    body += "<form action='/reset_dsp' method='POST'>"
+            "<button class='btn btn-gray'>Reset DSP</button></form>";
+
+    // ── Save to EEPROM ─────────────────────────────────────
+    if (captureReady) {
+      body += "<form action='/save_eeprom' method='POST'>"
+              "<button class='btn btn-green'>&#x1F4BE; Save to EEPROM (selfboot)</button></form>"
+              "<small style='display:block;margin-top:6px'>"
+              "Writes the current program to EEPROM. "
+              "Enable SELFBOOT on your DSP board to boot autonomously.</small>";
+    } else {
+      body += "<div class='warn' style='margin-top:12px'>"
+              "&#x26A0; Do a <b>Link Compile Download</b> in SigmaStudio first, "
+              "then the Save to EEPROM button will appear.</div>";
+    }
 
     body += "</body></html>";
     httpServer.send(200, "text/html", body);
   });
-
-  // ... rest of existing HTTP handlers (unchanged) ...
 
   // ── Save to EEPROM ─────────────────────────────────────────
   httpServer.on("/save_eeprom", HTTP_POST, []() {
@@ -512,19 +466,20 @@ void setupHTTP() {
       return;
     }
 
+    // Send immediate response, then write (writing takes a few seconds)
     httpServer.send(200, "text/html",
       htmlHead("Saving...") +
       "<div class='ok'>&#x23F3; Writing to EEPROM, please wait (~5 seconds)...</div>"
       "<script>setTimeout(()=>location.href='/eeprom_result',8000)</script></body></html>");
 
+    // Write EEPROM
     bool ok = writeEEPROM();
     prefs.begin("tcpi", false);
     prefs.putBool("eeprom_ok", ok);
     prefs.end();
   });
 
-  // (remaining handlers reproduced unchanged)
-
+  // ── EEPROM result ───────────────────────────────────────────
   httpServer.on("/eeprom_result", []() {
     prefs.begin("tcpi", true);
     bool ok = prefs.getBool("eeprom_ok", false);
@@ -544,7 +499,107 @@ void setupHTTP() {
     httpServer.send(200, "text/html", body);
   });
 
-  // (other handlers continue unchanged...)
+  // ── Config page ─────────────────────────────────────────────
+  httpServer.on("/config", []() {
+    String body = htmlHead("Configuration");
+    body += "<h3>WiFi</h3>"
+            "<form action='/save_wifi' method='POST'>"
+            "<label>SSID</label>"
+            "<input type='text' name='ssid' value='" + savedSSID + "' required>"
+            "<label>Password</label>"
+            "<input type='password' name='pass' placeholder='leave empty to keep current'>"
+            "<button class='btn btn-blue'>Save WiFi &amp; reboot</button></form>";
+
+    body += "<h3>GPIO Pins</h3>"
+            "<small>Do not use GPIO 6-11 (reserved for flash).</small>"
+            "<form action='/save_pins' method='POST'>"
+            "<div class='row'>"
+            "<div><label>SCL</label><input type='number' name='scl' value='" + String(pinSCL) + "' min='0' max='39'></div>"
+            "<div><label>SDA</label><input type='number' name='sda' value='" + String(pinSDA) + "' min='0' max='39'></div>"
+            "</div><div class='row'>"
+            "<div><label>RESET</label><input type='number' name='rst' value='" + String(pinRESET) + "' min='0' max='39'></div>"
+            "<div><label>SELFBOOT</label><input type='number' name='sb' value='" + String(pinSELFBOOT) + "' min='0' max='39'></div>"
+            "</div>"
+            "<label>LED</label><input type='number' name='led' value='" + String(pinLED) + "' min='0' max='39'>"
+            "<button class='btn btn-blue'>Save pins &amp; reboot</button></form>";
+
+    body += "<h3>Factory reset</h3>"
+            "<form action='/factory_reset' method='POST'>"
+            "<button class='btn btn-red'>Clear all settings</button></form>"
+            "</body></html>";
+    httpServer.send(200, "text/html", body);
+  });
+
+  httpServer.on("/save_wifi", HTTP_POST, []() {
+    if (!httpServer.hasArg("ssid") || httpServer.arg("ssid").isEmpty()) {
+      httpServer.send(400, "text/plain", "Missing SSID"); return;
+    }
+    String newSSID = httpServer.arg("ssid");
+    String newPass = httpServer.arg("pass");
+    if (newPass.isEmpty()) newPass = savedPassword;
+    saveWiFi(newSSID, newPass);
+
+    // Try to connect while keeping AP alive so browser stays connected
+    // WIFI_AP_STA: AP stays up during connection attempt
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(newSSID.c_str(), newPass.c_str());
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries++ < 20) delay(500);
+
+    String body = htmlHead("WiFi Saved");
+    if (WiFi.status() == WL_CONNECTED) {
+      String ip = WiFi.localIP().toString();
+      body += "<div class='ok'>&#x2705; Connected!<br><br>"
+              "<b>Network:</b> " + newSSID + "<br>"
+              "<b>IP address:</b> <a href='http://" + ip + "'>" + ip + "</a><br><br>"
+              "Save this address to access the device on your network.<br>"
+              "Rebooting in 5 seconds...</div>"
+              "<script>setTimeout(()=>location.href='http://" + ip + "/',5000)</script>";
+    } else {
+      body += "<div class='warn'>&#x26A0; Could not connect to <b>" + newSSID + "</b>.<br>"
+              "Check the password and try again. Rebooting in AP mode...</div>"
+              "<script>setTimeout(()=>location.href='/',4000)</script>";
+    }
+    body += "</body></html>";
+    httpServer.send(200, "text/html", body);
+    delay(1500); ESP.restart();
+  });
+
+  httpServer.on("/save_pins", HTTP_POST, []() {
+    int scl=httpServer.arg("scl").toInt(), sda=httpServer.arg("sda").toInt();
+    int rst=httpServer.arg("rst").toInt(), sb=httpServer.arg("sb").toInt();
+    int led=httpServer.arg("led").toInt();
+    bool ok = scl>0 && sda>0 && rst>=0 && sb>=0 && led>=0;
+    ok = ok && scl!=sda && scl!=rst && scl!=sb && scl!=led;
+    ok = ok && sda!=rst && sda!=sb  && sda!=led;
+    ok = ok && rst!=sb  && rst!=led && sb!=led;
+    for (int p:{scl,sda,rst,sb,led}) if(p>=6 && p<=11) ok=false;
+    if (!ok) {
+      httpServer.send(400, "text/html",
+        htmlHead("Error")+"<div class='err'>Invalid or duplicate pins. "
+        "GPIO 6-11 reserved. <a href='/config'>Back</a></div></body></html>");
+      return;
+    }
+    savePins(scl,sda,rst,sb,led);
+    httpServer.send(200, "text/html",
+      htmlHead("Saved")+"<div class='ok'>&#x2705; Saved. Rebooting...</div>"
+      "<script>setTimeout(()=>location.href='/',3000)</script></body></html>");
+    delay(1000); ESP.restart();
+  });
+
+  httpServer.on("/reset_dsp", HTTP_POST, []() {
+    resetDSP();
+    httpServer.send(200, "text/html",
+      htmlHead("DSP Reset")+"<div class='ok'>&#x2705; DSP reset OK.</div>"
+      "<script>setTimeout(()=>location.href='/',2000)</script></body></html>");
+  });
+
+  httpServer.on("/factory_reset", HTTP_POST, []() {
+    prefs.begin("tcpi", false); prefs.clear(); prefs.end();
+    httpServer.send(200, "text/html",
+      htmlHead("Reset")+"<div class='ok'>Cleared. Rebooting in AP mode...</div></body></html>");
+    delay(1000); ESP.restart();
+  });
 
   httpServer.on("/status", []() {
     String ip = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
@@ -559,15 +614,182 @@ void setupHTTP() {
   httpServer.begin();
 }
 
-// NOTE: The rest of the file (TCPi parser, write handler, safeload, I2C, etc.)
-// remains unchanged from previous version. Due to message length limits we
-// keep those functions as in the existing commit.
+// =============================================================
+// TCPi PROTOCOL PARSER
+// =============================================================
+int processBuffer(uint8_t* buf, int len) {
+  int pos = 0;
+  while (pos < len) {
+    uint8_t ctrl = buf[pos];
+    if (ctrl == CTRL_WRITE) {
+      if (pos + 10 > len) break;
+      uint8_t  safeload = buf[pos + 1];
+      uint16_t totalLen = (buf[pos + 3] << 8) | buf[pos + 4];
+      uint8_t  chipAddr = buf[pos + 5];
+      uint16_t dataLen  = (buf[pos + 6] << 8) | buf[pos + 7];
+      uint16_t address  = (buf[pos + 8] << 8) | buf[pos + 9];
+      if (pos + totalLen > len) { Serial.printf("[TCP] Frag %d/%d\n", len-pos, totalLen); break; }
+      uint8_t* payload  = buf + pos + 10;
+      Serial.printf("[W] 0x%04X len=%d sl=%d |", address, dataLen, safeload);
+      for (int d = 0; d < min((int)dataLen, 8); d++) Serial.printf(" %02X", payload[d]);
+      Serial.println();
+      handleWrite(chipAddr, address, payload, dataLen, safeload);
+      pos += totalLen;
+    } else if (ctrl == CTRL_READ_REQ) {
+      if (pos + 8 > len) break;
+      uint16_t totalLen = (buf[pos+1]<<8)|buf[pos+2];
+      uint8_t  chipAddr = buf[pos+3];
+      uint16_t dataLen  = (buf[pos+4]<<8)|buf[pos+5];
+      uint16_t address  = (buf[pos+6]<<8)|buf[pos+7];
+      if (pos + totalLen > len) break;
+      handleRead(chipAddr, address, dataLen);
+      pos += totalLen;
+    } else { pos++; }
+  }
+  return pos;
+}
 
 // =============================================================
-// The original implementation continued below unchanged (TCPi parser,
-// handleWrite, safeloadChunk, directWrite, handleRead, resetDSP, scanI2C,
-// blinkLED, etc.)
+// WRITE HANDLER
 // =============================================================
+void handleWrite(uint8_t chipAddr, uint16_t address, uint8_t* data, uint16_t dataLen, uint8_t safeload) {
+  bool isDSP      = (chipAddr == 0x01 || chipAddr == DSP_I2C_ADDR);
+  bool isParamRAM = (address <= PARAM_RAM_END);
 
-// For brevity the remainder of the file is left as previously committed.
-// (No functional changes to TCPi/I2C/EEPROM code.)
+  uint8_t i2cAddr = (chipAddr == 0x01) ? DSP_I2C_ADDR :
+                    (chipAddr == 0x02) ? EEPROM_I2C_ADDR : chipAddr;
+
+  // Capture sl=0 DSP writes BEFORE updating captureReady
+  // This ensures the final 0x081C DSPRUN=1 write is included in the capture
+  if (isDSP && safeload == 0 && !captureReady) {
+    captureWrite(address, data, dataLen);
+  }
+
+  // Track DSP state and detect end of Download
+  if (isDSP && address == 0x081C && dataLen >= 2) {
+    lastCoreCtrl[0] = data[dataLen - 2];
+    lastCoreCtrl[1] = data[dataLen - 1];
+    bool wasRunning = dspRunning;
+    dspRunning = (lastCoreCtrl[1] & 0x04) != 0;
+    if (!wasRunning && dspRunning) {
+      // DSPRUN just went high = Download complete
+      captureReady = true;
+      Serial.printf("[DSP] Running! Capture ready: %d bytes\n", captureLen);
+    }
+  }
+
+  if (isDSP && isParamRAM && dspRunning && safeload == 1) {
+    // Safeload: split into 5-word atomic IST chunks
+    int totalWords = dataLen / 4, offset = 0, nChunks = 0;
+    while (offset < totalWords) {
+      int words = min(totalWords - offset, 5);
+      safeloadChunk(address + offset, data + offset * 4, words);
+      offset += words; nChunks++;
+    }
+    Serial.printf("[SAFELOAD] 0x%04X %d words %d ISTs\n", address, totalWords, nChunks);
+  } else {
+    directWrite(i2cAddr, address, data, dataLen);
+  }
+}
+
+// =============================================================
+// SAFELOAD
+// =============================================================
+void safeloadChunk(uint16_t address, uint8_t* data, int words) {
+  for (int i = 0; i < words; i++) {
+    uint16_t reg = SAFELOAD_DATA_0 + i;
+    uint8_t* w   = data + (i * 4);
+    Wire.beginTransmission(DSP_I2C_ADDR);
+    Wire.write((reg>>8)&0xFF); Wire.write(reg&0xFF);
+    Wire.write(0x00);
+    Wire.write(w[0]); Wire.write(w[1]); Wire.write(w[2]); Wire.write(w[3]);
+    Wire.endTransmission(true);
+  }
+  for (int i = 0; i < words; i++) {
+    uint16_t reg  = SAFELOAD_ADDR_0 + i;
+    uint16_t dest = address + i;
+    Wire.beginTransmission(DSP_I2C_ADDR);
+    Wire.write((reg>>8)&0xFF); Wire.write(reg&0xFF);
+    Wire.write((dest>>8)&0xFF); Wire.write(dest&0xFF);
+    Wire.endTransmission(true);
+  }
+  Wire.beginTransmission(DSP_I2C_ADDR);
+  Wire.write(0x08); Wire.write(0x1C);
+  Wire.write(lastCoreCtrl[0]);
+  Wire.write(lastCoreCtrl[1] | IST_BIT);
+  Wire.endTransmission(true);
+}
+
+// =============================================================
+// CHUNKED I2C WRITE
+// =============================================================
+void directWrite(uint8_t i2cAddr, uint16_t regAddr, uint8_t* data, uint16_t dataLen) {
+  int wordSize = 4;
+  if (regAddr >= PROG_RAM_START && regAddr <= PROG_RAM_END) wordSize = 5;
+  else if (regAddr >= CTRL_REG_START) wordSize = 2;
+  int chunkBytes = 30 * wordSize, offset = 0;
+  while (offset < dataLen) {
+    int      bytes = min(dataLen - offset, chunkBytes);
+    uint16_t addr  = regAddr + (offset / wordSize);
+    Wire.beginTransmission(i2cAddr);
+    Wire.write((addr>>8)&0xFF); Wire.write(addr&0xFF);
+    Wire.write(data + offset, bytes);
+    uint8_t err = Wire.endTransmission(true);
+    if (err != 0) {
+      Serial.printf("[I2C] ERR 0x%04X len=%d err=%d\n", addr, bytes, err);
+      Wire.end(); delay(5);
+      Wire.setBufferSize(2048);
+      Wire.begin(pinSDA, pinSCL, 400000);
+      Wire.setTimeOut(50);
+    }
+    offset += bytes;
+  }
+}
+
+// =============================================================
+// I2C READ
+// =============================================================
+void handleRead(uint8_t chipAddr, uint16_t address, uint16_t nBytes) {
+  uint8_t i2cAddr = (chipAddr==0x01) ? DSP_I2C_ADDR :
+                    (chipAddr==0x02) ? EEPROM_I2C_ADDR : chipAddr;
+  Wire.beginTransmission(i2cAddr);
+  Wire.write((address>>8)&0xFF); Wire.write(address&0xFF);
+  Wire.endTransmission(false);
+  Wire.requestFrom((int)i2cAddr, (int)nBytes, true);
+  uint8_t rd[256]={0}; int idx=0;
+  while (Wire.available() && idx<(int)nBytes && idx<256) rd[idx++]=Wire.read();
+  uint8_t resp[270]; int sz=9+idx;
+  resp[0]=CTRL_READ_RESP;
+  resp[1]=(sz>>8)&0xFF; resp[2]=sz&0xFF;
+  resp[3]=chipAddr;
+  resp[4]=(idx>>8)&0xFF; resp[5]=idx&0xFF;
+  resp[6]=(address>>8)&0xFF; resp[7]=address&0xFF;
+  resp[8]=0x01;
+  memcpy(resp+9,rd,idx);
+  if (client && client.connected()) client.write(resp, 9+idx);
+}
+
+// =============================================================
+void resetDSP() {
+  dspRunning = false;
+  digitalWrite(pinRESET, LOW); delay(10);
+  digitalWrite(pinRESET, HIGH); delay(50);
+  Serial.println("[DSP] Reset OK");
+}
+
+void scanI2C() {
+  Serial.println("[I2C] Scanning:");
+  for (uint8_t a=1; a<127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission()==0) Serial.printf("  Found 0x%02X\n", a);
+  }
+}
+
+void blinkLED(int n) {
+  bool wasOn = (digitalRead(pinLED)==HIGH);
+  for (int i=0; i<n; i++) {
+    digitalWrite(pinLED,HIGH); delay(100);
+    digitalWrite(pinLED,LOW);  delay(100);
+  }
+  if (wasOn || (!apMode && client && client.connected())) digitalWrite(pinLED,HIGH);
+}
